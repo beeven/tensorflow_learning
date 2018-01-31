@@ -50,7 +50,7 @@ def cnn_model_fn(features, labels, mode):
     dropout = tf.layers.dropout(inputs=dense, rate=0.4, training=mode == tf.estimator.ModeKeys.TRAIN)
 
     # Logits Layer
-    logits = tf.layers.dense(inputs=dropout, units=0)
+    logits = tf.layers.dense(inputs=dropout, units=10)
 
     predictions = {
         # Generate preditions (for PREDICT and EVAL mode)
@@ -63,10 +63,10 @@ def cnn_model_fn(features, labels, mode):
         return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
 
     # Calculate Loss (for both TRAIN and EVAL modes)
-    onehot_labels = tf.one_hot(indices=tf.cast(labels, tf.int32), depth=10)
-    loss = tf.losses.softmax_cross_entropy(onehot_labels=onehot_labels, logits=logits)
+    #onehot_labels = tf.one_hot(indices=tf.cast(labels, tf.int32), depth=10)
+    #loss = tf.losses.softmax_cross_entropy(onehot_labels=onehot_labels, logits=logits)
 
-    #loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
+    loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
 
     # Configure the Training Op (for TRAIN mode)
     if mode == tf.estimator.ModeKeys.TRAIN:
@@ -90,6 +90,8 @@ def main(unused_argv):
     # Create the Estimator
     mnist_classifier = tf.estimator.Estimator(model_fn=cnn_model_fn, model_dir="./mnist_convnet_model")
 
+    print(mnist_classifier.get_variable_names())
+
     # Set up loggin for predictions
     tensors_to_log = {"probabilities":"softmax_tensor"}
     logging_hook = tf.train.LoggingTensorHook(tensors=tensors_to_log, every_n_iter=50)
@@ -103,8 +105,12 @@ def main(unused_argv):
         shuffle=True)
     mnist_classifier.train(
         input_fn=train_input_fn,
-        steps=20000,
-        hooks=[logging_hook])
+        steps=200,
+        hooks=[
+            #logging_hook
+            ])
+
+    
 
     # Evaluate the Model
     eval_input_fn = tf.estimator.inputs.numpy_input_fn(

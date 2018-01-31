@@ -1,5 +1,5 @@
 from tensorflow.examples.tutorials.mnist import input_data
-mnist = input_data.read_data_sets('MNIST_data', one_hot=True)
+mnist = input_data.read_data_sets('MNIST-data', one_hot=True)
 
 import tensorflow as tf
 
@@ -65,7 +65,7 @@ train_step = tf.train.AdamOptimizer(1e-4).minimize(cross_entropy)
 correct_prediction = tf.equal(tf.argmax(y_conv, 1), tf.argmax(y_, 1))
 accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
 
-with tf.Session() as sess:
+with tf.Session(config=tf.ConfigProto(device_count={'GPU':0})) as sess:
     sess.run(tf.global_variables_initializer())
     for i in range(20000):
         batch = mnist.train.next_batch(50)
