@@ -90,7 +90,7 @@ def main(unused_argv):
     # Create the Estimator
     mnist_classifier = tf.estimator.Estimator(model_fn=cnn_model_fn, model_dir="./mnist_convnet_model")
 
-    print(mnist_classifier.get_variable_names())
+    #print(mnist_classifier.get_variable_names())
 
     # Set up loggin for predictions
     tensors_to_log = {"probabilities":"softmax_tensor"}
@@ -105,7 +105,7 @@ def main(unused_argv):
         shuffle=True)
     mnist_classifier.train(
         input_fn=train_input_fn,
-        steps=200,
+        steps=20000,
         hooks=[
             #logging_hook
             ])
