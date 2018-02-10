@@ -4,3 +4,4 @@ mnist_convnet_model/
 flower_photos.tgz
 models/
 .ipynb_checkpoints/
+data/

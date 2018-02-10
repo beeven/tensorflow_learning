@@ -36,7 +36,7 @@ def savetxt(filename, ndarray):
     
     print("Saving", filename)
     with open(filename, "w") as f:
-        labels = list(map(' '.join, np.eye(10, dtype=np.uint).astype(str)))
+        labels = list(map(' '.join, np.eye(10, dtype=np.uint8).astype(str)))
         for row in ndarray:
             row_str = row.astype(str)
             label_str = labels[row[-1]]
