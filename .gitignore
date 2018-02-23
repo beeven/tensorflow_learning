@@ -5,3 +5,4 @@ flower_photos.tgz
 models/
 .ipynb_checkpoints/
 data/
+cifar-10-batches-py
