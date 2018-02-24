@@ -1,158 +1,235 @@
+#!/usr/bin/env python3
 
-from __future__ import print_function # Use a function definition from future version (say 3.x from 2.7 interpreter)
-
-from PIL import Image
-import getopt
+import matplotlib.pyplot as plt
+import math
 import numpy as np
-import pickle as cp
 import os
-import shutil
-import struct
+import PIL
 import sys
-import tarfile
-import xml.etree.cElementTree as et
-import xml.dom.minidom
-
-try:
-    from urllib.request import urlretrieve
-except ImportError:
-    from urllib import urlretrieve
+from urllib.request import urlopen
 
 
-imgSize = 32
-numFeatures = imgSize * imgSize * 3
+import cntk as C
+import cntk.io.transforms as xforms
 
-
-def readBatch(src):
-    with open(src, 'rb') as f:
-        d = cp.load(f, encoding='latin1')
-        data = d['data']
-        feat = data
-    res = np.hstack((feat, np.reshape(d['labels'], (len(d['labels']), 1))))
-    return res.astype(np.int)
-
-def loadData(src, dest):
-    if os.path.exists(dest):
-        print("Data file exists, reuse cached data file.")
-        fname = dest
+if 'TEST_DEVICE' in os.environ:
+    if os.environ['TEST_DEVICE'] == 'cpu':
+        C.device.try_set_default_device(C.device.cpu())
     else:
-        print('Downloading ' + src)
-        fname, h = urlretrieve(src, dest)
-        print('Done.')
+        C.device.try_set_default_device(C.device.gpu(0))
 
-    print('Extracting files...')
-    with tarfile.open(fname) as tar:
-        tar.extractall()
-    print('Done.')
-    print('Preparing train set...')
-    trn = np.empty((0, numFeatures + 1), dtype=np.int)
-    for i in range(5):
-        batchName = './cifar-10-batches-py/data_batch_{0}'.format(i+1)
-        trn = np.vstack((trn,readBatch(batchName)))
-    print('Done.')
-    print('Preparing test set...')
-    tst = readBatch('./cifar-10-batches-py/test_batch')
-    return (trn,tst)
+data_path = os.path.join('data', 'CIFAR-10')
 
-def saveTxt(filename, ndarray):
-    with open(filename, 'w') as f:
-        labels = list(map(' '.join, np.eye(10, dtype=np.uint8).astype(str)))
-        for row in ndarray:
-            row_str = row.astype(str)
-            label_str = labels[row[-1]]
-            feature_str = ' '.join(row_str[:-1])
-            f.write('|labels {} |features {}\n'.format(label_str, feature_str))
+# model dimensions
+image_height = 32
+image_width = 32
+num_channels = 3
+num_classes = 10
 
-def saveImage(fname, data, label, mapFile, regrFile, pad, **key_parms):
-    # data in CIFAR-10 dataset is in CHW format.
-    pixData = data.reshape((3, imgSize, imgSize))
-    if 'mean' in key_parms:
-        key_parms['mean'] += pixData
+def create_reader(map_file, mean_file, is_training):
+    print("Reading map file:", map_file)
+    print("Reading mean file:", mean_file)
+
+    if not os.path.exists(map_file) or not os.path.exists(mean_file):
+        raise RuntimeError("This tutorials depends 201A tutorials, please run 201A first.")
+
+    # transformation pipeline for the features has jitter/crop only when training
+    transforms = []
+    # train uses data augmentation (translation only)
+    if is_training:
+        transforms += [
+            xforms.crop(crop_type='randomside', side_ratio=0.8)
+        ]
+    transforms += [
+        xforms.scale(width=image_width, height=image_height, channels=num_channels, interpolations='linear'),
+        xforms.mean(mean_file)
+    ]
+    # deserializer
+    return C.io.MinibatchSource(C.io.ImageDeserializer(map_file, C.io.StreamDefs(
+        features = C.io.StreamDef(field='image', transforms=transforms), # first column in map file is referred to as 'image'
+        labels   = C.io.StreamDef(field='label', shape=num_classes)      # and second as 'label'
+    )))
+
+
+# Create the train and test readers
+reader_train = create_reader(os.path.join(data_path, 'train_map.txt'),
+                             os.path.join(data_path, 'CIFAR-10_mean.xml'), True)
+
+reader_test = create_reader(os.path.join(data_path, 'test_map.txt'),
+                            os.path.join(data_path, 'CIFAR-10_mean.xml'), False)
+
+
+
+# Model Creation (Basic CNN)
+def create_basic_model(input, out_dims):
+    with C.layers.default_options(init=C.glorot_uniform(), activation=C.relu):
+        net = C.layers.Convolution((5,5), 32, pad=True)(input)
+        net = C.layers.MaxPooling((3,3), strides=(2,2))(net)
+
+        net = C.layers.Convolution((5,5), 32, pad=True)(net)
+        net = C.layers.MaxPooling((3,3), strides=(2,2))(net)
+
+        net = C.layers.Convolution((5,5), 64, pad=True)(net)
+        net = C.layers.MaxPooling((3,3), strides=(2,2))(net)
+
+        net = C.layers.Dense(64)(net)
+        net = C.layers.Dense(out_dims, activation=None)(net)
+
+    return net
+
+
+def train_and_evaluate(reader_train, reader_test, max_epochs, model_func):
+    # Input variables denoting the features and label data
+    input_var = C.input_variable((num_channels, image_height, image_width))
+    label_var = C.input_variable((num_classes))
+
+    # Normalize the input
+    feature_scale = 1.0 / 256.0
+    input_var_norm = C.element_times(feature_scale, input_var)
+
+    # apply model to input
+    z = model_func(input_var_norm, out_dims=10)
+
+    #
+    # Training action
+    #
+
+    # loss and metric
+    ce = C.cross_entropy_with_softmax(z, label_var)
+    pe = C.classification_error(z, label_var)
+
+    # training config
+    epoch_size     = 50000
+    minibatch_size = 64
+
+    # Set training parameters
+    lr_per_minibatch       = C.learning_parameter_schedule([0.01]*10 + [0.003]*10 + [0.001],
+                                                       epoch_size=epoch_size)
+    momentums              = C.momentum_schedule(0.9, minibatch_size=minibatch_size)
+    l2_reg_weight          = 0.001
+
+    # trainer object
+    learner = C.momentum_sgd(z.parameters,
+                             lr = lr_per_minibatch,
+                             momentum = momentums,
+                             l2_regularization_weight=l2_reg_weight)
+    progress_printer = C.logging.ProgressPrinter(tag='Training', num_epochs=max_epochs)
+    trainer = C.Trainer(z, (ce, pe), [learner], [progress_printer])
+
+    # define mapping from reader streams to network inputs
+    input_map = {
+        input_var: reader_train.streams.features,
+        label_var: reader_train.streams.labels
+    }
+
+    C.logging.log_number_of_parameters(z) ; print()
+
+    # perform model training
+    batch_index = 0
+    plot_data = {'batchindex':[], 'loss':[], 'error':[]}
+    for epoch in range(max_epochs):       # loop over epochs
+        sample_count = 0
+        while sample_count < epoch_size:  # loop over minibatches in the epoch
+            data = reader_train.next_minibatch(min(minibatch_size, epoch_size - sample_count),
+                                               input_map=input_map) # fetch minibatch.
+            trainer.train_minibatch(data)                                   # update model with it
+
+            sample_count += data[label_var].num_samples                     # count samples processed so far
+
+            # For visualization...
+            plot_data['batchindex'].append(batch_index)
+            plot_data['loss'].append(trainer.previous_minibatch_loss_average)
+            plot_data['error'].append(trainer.previous_minibatch_evaluation_average)
+
+            batch_index += 1
+        trainer.summarize_training_progress()
+
+    #
+    # Evaluation action
+    #
+    epoch_size     = 10000
+    minibatch_size = 16
+
+    # process minibatches and evaluate the model
+    metric_numer    = 0
+    metric_denom    = 0
+    sample_count    = 0
+    minibatch_index = 0
+
+    while sample_count < epoch_size:
+        current_minibatch = min(minibatch_size, epoch_size - sample_count)
+
+        # Fetch next test min batch.
+        data = reader_test.next_minibatch(current_minibatch, input_map={
+            input_var: reader_test.streams.features,
+            label_var: reader_test.streams.labels
+        })
+
+        # minibatch data to be trained with
+        metric_numer += trainer.test_minibatch(data) * current_minibatch
+        metric_denom += current_minibatch
+
+        # Keep track of the number of samples processed so far.
+        sample_count += data[label_var].num_samples
+        minibatch_index += 1
+
+    print("")
+    print("Final Results: Minibatch[1-{}]: errs = {:0.1f}% * {}".format(minibatch_index+1, (metric_numer*100.0)/metric_denom, metric_denom))
+    print("")
+
+    # Visualize training result:
+    window_width            = 32
+    loss_cumsum             = np.cumsum(np.insert(plot_data['loss'], 0, 0))
+    error_cumsum            = np.cumsum(np.insert(plot_data['error'], 0, 0))
+
+    # Moving average.
+    plot_data['batchindex'] = np.insert(plot_data['batchindex'], 0, 0)[window_width:]
+    plot_data['avg_loss']   = (loss_cumsum[window_width:] - loss_cumsum[:-window_width]) / window_width
+    plot_data['avg_error']  = (error_cumsum[window_width:] - error_cumsum[:-window_width]) / window_width
+
+    figure, axes = plt.subplots(2,1)
+    axes[0].plot(plot_data["batchindex"], plot_data["avg_loss"], 'b--')
+    axes[0].set_xlabel('Minibatch number')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Minibatch run vs. Training loss ')
+
+    axes[1].plot(plot_data["batchindex"], plot_data["avg_error"], 'r--')
+    axes[1].set_xlabel('Minibatch number')
+    axes[1].set_ylabel('Label Prediction Error')
+    axes[1].set_title('Minibatch run vs. Label Prediction Error ')
+    plt.tight_layout()
+    plt.show()
+
+    return C.softmax(z)
+
+
+pred = train_and_evaluate(reader_train, reader_test, max_epochs=5, model_func=create_basic_model)
+
+
+
+def create_basic_model_terse(input, out_dims):
+    with C.layers.default_options(init=C.glorot_uniform(), activation=C.relu):
+        model = C.layers.Sequential([
+            C.layers.For(range(3), lambda i: [
+                C.layers.Convolution((5,5), [32,32,64][i], pad=True),
+                C.layers.MaxPooling((3,3), strides=(2,2))
+            ]),
+            C.layers.Dense(64),
+            C.layers.Dense(out_dims, activation=None)
+        ])
+    return model(input)
+
+pred_basic_model = train_and_evaluate(reader_train, reader_test, max_epochs=10, model_func=create_basic_model_terse)
+
+def evaluate(pred_op, image_data):
+    label_lookup =  ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
+    image_mean = 133.0
+    image_data -= image_mean
+    image_data = np.ascontiguousarray(np.transpose(image_data, (2,0,1)))
+    result = np.squeeze(pred_op.eval({pred_op.arguments[0]:[image_data]}))
     
-    if pad > 0:
-        pixData = np.pad(pixData, ((0, 0), (pad, pad), (pad, pad)), mode='constant', constant_values=128)
-    
-    img = Image.new('RGB', (imgSize + 2 * pad, imgSize + 2 * pad))
-    pixels = img.load()
-    for x in range(img.size[0]):
-        for y in range(img.size[1]):
-            pixels[x, y] = (pixData[0][y][x], pixData[1][y][x], pixData[2][y][x])
-    img.save(fname)
-    mapFile.write("%s\t%d\n" % (fname, label))
-
-    # compute per channel maean and store for regression example
-    channelMean = np.mean(pixData, axis=(1,2))
-    regrFile.write("|regrLabels\t%f\t%f\t%f\n" % (channelMean[0]/255.0, channelMean[1]/255.0, channelMean[2]/255.0))
-
-def saveMean(fname, data):
-    root = et.Element('opencv_storage')
-    et.SubElement(root, 'Channel').text = '3'
-    et.SubElement(root, 'Row').text = str(imgSize)
-    et.SubElement(root, 'Col').text = str(imgSize)
-    meanImg = et.SubElement(root, 'MeanImg', type_id='opencv-matrix')
-    et.SubElement(meanImg, 'rows').text = '1'
-    et.SubElement(meanImg, 'cols').text = str(imgSize * imgSize * 3)
-    et.SubElement(meanImg, 'dt').text = 'f'
-    et.SubElement(meanImg, 'data').text = ' '.join(['%e' % n for n in np.reshape(data, (imgSize * imgSize * 3))])
-
-    x = xml.dom.minidom.parseString(et.tostring(root))
-    with open(fname, 'w') as f:
-        f.write(x.toprettyxml(indent='  '))
-
-def saveTrainImages(filename, foldername):
-    if not os.path.exists(foldername):
-        os.makedirs(foldername)
-    data = {}
-    dataMean = np.zeros((3, imgSize, imgSize)) # mean is in CHW format.
-    with open('train_map.txt', 'w') as mapFile:
-        with open('train_regrLabels.txt', 'w') as regrFile:
-            for ifile in range(1, 6):
-                with open(os.path.join('./cifar-10-batches-py', 'data_batch_' + str(ifile)), 'rb') as f:
-                    data = cp.load(f, encoding='latin1')
-                    for i in range(10000):
-                        fname = os.path.join(os.path.abspath(foldername), ('%05d.png' % (i + (ifile - 1) * 10000)))
-                        saveImage(fname, data['data'][i, :], data['labels'][i], mapFile, regrFile, 4, mean=dataMean)
-    dataMean = dataMean / (50*1000)
-    saveMean('CIFAR-10_mean.xml', dataMean)
-
-def saveTestImages(filename, foldername):
-    if not os.path.exists(foldername):
-        os.makedirs(foldername)
-    with open('test_map.txt','w') as mapFile:
-        with open('test_regrlabels.txt', 'w') as regrFile:
-            with open(os.path.join('./cifar-10-batches-py', 'test_batch'), 'rb') as f:
-                data = cp.load(f, encoding='latin1')
-                for i in range(10000):
-                    fname = os.path.join(os.path.abspath(foldername), ('%05d.png' % i))
-                    saveImage(fname, data['data'][i, :], data['labels'][i], mapFile, regrFile, 0)
-                    
-        
-
-
-url_cifar_data = 'http://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz'
-data_dir = './data/CIFAR-10'
-data_filename = data_dir + "/cifar-10-python.tar.gz"
-train_filename = data_dir+ '/Train_cntk_text.txt'
-test_filename = data_dir + '/Test_cntk_text.txt'
-
-train_img_directory = data_dir + '/Train'
-test_img_directory = data_dir + '/Test'
-
-root_dir = os.getcwd()
-
-os.makedirs(data_dir, exist_ok=True)
-
-
-trn, tst = loadData(url_cifar_data, data_filename)
-print("Writing train text file...")
-saveTxt(train_filename, trn)
-print("Done.")
-print("Writing test text file...")
-saveTxt(test_filename, tst)
-print("Done.")
-print('Converting train data to png images...')
-saveTrainImages(train_filename, train_img_directory)
-print("Done.")
-print ('Converting test data to png images...')
-saveTestImages(test_filename, test_img_directory)
-print("Done.")
+    top_count = 3
+    result_indices = (-np.array(result)).argsort()[:top_count]
+    print("Top 3 predictions:")
+    for i in range(top_count):
+        print("\tLabel: {:10s}, confidence: {:.2f}%".format(label_lookup[result_indices[i]], result[result_indices[i]]* 100))
